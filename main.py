@@ -4,6 +4,8 @@ from __future__ import annotations
 import json
 import os
 import threading
+import time
+from dataclasses import asdict
 from datetime import datetime
 
 from kivy.app import App
@@ -86,6 +88,9 @@ class BusMedApp(App):
 
     def build(self):
         self.catcher: core.Catcher | None = None
+        self.service = None
+        self.running = False
+        self.log_offset = 0
         self.lines: list[str] = []
 
         root = BoxLayout(orientation="vertical", padding=dp(10), spacing=dp(6))
@@ -138,6 +143,8 @@ class BusMedApp(App):
         row.add_widget(self.stop_btn)
         form.add_widget(row)
 
+        form.add_widget(button("Battery settings (allow background)", self.on_battery))
+
         form_scroll = ScrollView(size_hint_y=0.55, bar_width=dp(3))
         form_scroll.add_widget(form)
         root.add_widget(form_scroll)
@@ -152,8 +159,20 @@ class BusMedApp(App):
         root.add_widget(self.log_scroll)
 
         self.load_all()
+        self.ask_notification_permission()
+        Clock.schedule_interval(self.poll_service, 1)
+        self.restore_running()
         self.log("Paste your cookie, tap Save, then Status to check it works.", "dim")
         return root
+
+    def ask_notification_permission(self) -> None:
+        if platform != "android":
+            return
+        try:
+            from android.permissions import request_permissions  # type: ignore
+            request_permissions(["android.permission.POST_NOTIFICATIONS"])
+        except Exception:
+            pass
 
     # ------------------------------------------------------------ storage #
 
@@ -323,36 +342,153 @@ class BusMedApp(App):
                 self.log(line, "ok")
         self._in_thread(work)
 
+    # ---------------------------------------------- background service #
+
+    def p(self, name: str) -> str:
+        return os.path.join(self.user_data_dir, name)
+
+    def set_running(self, running: bool) -> None:
+        self.running = running
+        self.catch_btn.disabled = running
+        self.stop_btn.disabled = not running
+
+    @staticmethod
+    def _alive(pid: int) -> bool:
+        try:
+            os.kill(pid, 0)
+            return True
+        except PermissionError:
+            return True
+        except OSError:
+            return False
+
+    def read_status(self) -> dict:
+        try:
+            with open(self.p("status.json"), encoding="utf-8") as fh:
+                return json.load(fh)
+        except (OSError, ValueError):
+            return {}
+
     def on_catch(self) -> None:
-        if self.catcher is not None:
+        if self.running:
             return
         cfg = self.build_cfg()
         if cfg is None:
             return
         self.refresh_cookie_info()
-        self.catcher = core.Catcher(
-            core.Client(cfg), cfg, self.log,
-            on_done=lambda r: Clock.schedule_once(lambda _dt: self._finished(r)),
-            on_alert=lambda m: (self.log(m, "warn"), vibrate()))
-        self.catch_btn.disabled = True
-        self.stop_btn.disabled = False
-        keep_screen_on(True)
-        self.log(f"catching {cfg.route_name or 'any route'} {cfg.departure_time}. "
-                 f"Keep the app open.", "info")
-        threading.Thread(target=self.catcher.run, daemon=True).start()
+        if platform == "android":
+            self.start_service(cfg)
+        else:  # desktop testing: same logic, plain thread
+            self.catcher = core.Catcher(
+                core.Client(cfg), cfg, self.log,
+                on_done=lambda r: Clock.schedule_once(lambda _dt: self._finished(r)),
+                on_alert=lambda m: self.log(m, "warn"))
+            self.set_running(True)
+            threading.Thread(target=self.catcher.run, daemon=True).start()
+
+    def start_service(self, cfg: core.Config) -> None:
+        try:
+            os.makedirs(self.user_data_dir, exist_ok=True)
+            fd = os.open(self.p("job.json"), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(asdict(cfg), fh)
+            for name in ("stop.flag",):
+                try:
+                    os.remove(self.p(name))
+                except OSError:
+                    pass
+            open(self.p("service.log"), "w").close()
+            with open(self.p("status.json"), "w", encoding="utf-8") as fh:
+                json.dump({"state": "starting", "t": time.time()}, fh)
+            from android import AndroidService  # type: ignore
+            self.service = AndroidService("BusMed", "Watching for your bus")
+            self.service.start(self.user_data_dir)
+        except Exception as exc:
+            self.log(f"could not start the background service: {exc}", "err")
+            return
+        self.log_offset = 0
+        self.set_running(True)
+        self.log("running in the background. You can lock the phone or leave the app.", "info")
+
+    def restore_running(self) -> None:
+        """App reopened while the service is still working: pick the log back up."""
+        if platform != "android":
+            return
+        st = self.read_status()
+        if st.get("state") == "running" and self._alive(int(st.get("pid") or 0)):
+            self.log_offset = 0
+            self.set_running(True)
+
+    def poll_service(self, _dt) -> None:
+        if platform != "android" or not self.running:
+            return
+        try:
+            with open(self.p("service.log"), "rb") as fh:
+                fh.seek(self.log_offset)
+                chunk = fh.read()
+                self.log_offset += len(chunk)
+        except OSError:
+            chunk = b""
+        for raw in chunk.decode("utf-8", errors="replace").splitlines():
+            try:
+                _t, level, msg = json.loads(raw)
+            except ValueError:
+                continue
+            self._append(msg, "warn" if level == "alert" else level)
+        st = self.read_status()
+        state = st.get("state")
+        if state == "done":
+            self.set_running(False)
+            self.log("finished." if st.get("ok") else "stopped without a ticket.", "dim")
+        elif state == "running" and not self._alive(int(st.get("pid") or 0)):
+            self.set_running(False)
+            self.log("the background service died (Android killed it?). Tap Catch to restart.",
+                     "err")
+        elif state == "starting" and time.time() - float(st.get("t") or 0) > 20:
+            self.set_running(False)
+            self.log("the service never started. Check that the build includes it.", "err")
 
     def on_stop(self) -> None:
-        if self.catcher is not None:
+        if not self.running:
+            return
+        if platform == "android":
+            try:
+                open(self.p("stop.flag"), "w").close()
+            except OSError:
+                pass
+            self.log("stopping...", "warn")
+            Clock.schedule_once(self._force_stop, 6)
+        elif self.catcher is not None:
             self.catcher.stop()
             self.log("stopping...", "warn")
 
-    def _finished(self, result: dict) -> None:
+    def _force_stop(self, _dt) -> None:
+        if self.running and platform == "android":
+            try:
+                if self.service is not None:
+                    self.service.stop()
+            except Exception:
+                pass
+            self.set_running(False)
+
+    def on_battery(self) -> None:
+        """Open Android's battery-optimization list so the app can be exempted."""
+        if platform != "android":
+            self.log("only on Android", "dim")
+            return
+        try:
+            from jnius import autoclass  # type: ignore
+            Intent = autoclass("android.content.Intent")
+            Settings = autoclass("android.provider.Settings")
+            activity = autoclass("org.kivy.android.PythonActivity").mActivity
+            activity.startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
+            self.log("set BusMed to 'Unrestricted' / 'Don't optimize'", "info")
+        except Exception as exc:
+            self.log(f"could not open settings: {exc}", "err")
+
+    def _finished(self, result: dict) -> None:  # desktop thread path
         self.catcher = None
-        self.catch_btn.disabled = False
-        self.stop_btn.disabled = True
-        keep_screen_on(False)
-        if result.get("ok"):
-            vibrate(2.0)
+        self.set_running(False)
         self.log("done." if result.get("ok") else "stopped.", "dim")
 
     # ----------------------------------------------------------- lifecycle #

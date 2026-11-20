@@ -389,7 +389,14 @@ class Catcher:
         notified: set[int] = set()
         while not self.stop_event.is_set():
             now = datetime.now().astimezone()
-            routes, current, stamps = load_routes(self.client)
+            try:
+                routes, current, stamps = load_routes(self.client)
+            except ApiError as exc:
+                if exc.status in (401, 403):
+                    raise
+                self.log(f"{exc}; retrying in 15s", "warn")  # offline, 5xx, timeouts
+                self._sleep(15)
+                continue
             target = pick_route(routes, cfg, now, stamps)
             if target is None:
                 self.log("no route matches your name/time. Check them with Status.", "err")
@@ -407,10 +414,11 @@ class Catcher:
                 self.log("that bus has already left.", "warn")
                 return {"ok": False}
 
-            for m in cfg.lead_minutes:
-                if m not in notified and 0 < (dep_at - now).total_seconds() <= m * 60:
-                    notified.add(m)
-                    self.on_alert(f"bus in {m} min")
+            left = (dep_at - now).total_seconds()
+            due = [m for m in cfg.lead_minutes if 0 < left <= m * 60 and m not in notified]
+            if due:
+                notified.update(due)           # only announce the closest threshold
+                self.on_alert(f"bus in {min(due)} min")
 
             to_window = (window_at - now).total_seconds() if window_at else 0.0
             if live is not None or to_window <= cfg.sprint_lead_seconds:

@@ -18,3 +18,9 @@ Kivy port of busmed.py. `core.py` = logic (tested against tools/mock_api.py), `m
 3. Status to check routes, Catch to wait for the window and book. Keep the app open and the screen on.
 
 The cookie is stored only in the app's private storage and is sent only to bus-med.1337.ma.
+
+## Background mode
+Catch starts `service.py` as an Android foreground service (persistent notification + CPU wake
+lock), so it keeps running with the screen off or the app closed, until the ticket is booked,
+the bus leaves, you tap Stop, or the cookie is rejected. Tap "Battery settings" once and set
+BusMed to Unrestricted. On Xiaomi/Oppo/Samsung also allow autostart / lock the app in Recents.
