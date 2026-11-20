@@ -18,6 +18,8 @@ fullscreen = 0
 # VIBRATE: alert when the ticket is booked
 # WAKE_LOCK: lets the keep-screen-on flag work reliably
 android.permissions = INTERNET,VIBRATE,WAKE_LOCK,FOREGROUND_SERVICE,POST_NOTIFICATIONS
+p4a.branch = v2024.01.21
+android.ndk = 25b
 android.api = 33
 android.minapi = 24
 android.archs = arm64-v8a
