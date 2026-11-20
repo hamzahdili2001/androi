@@ -9,22 +9,21 @@ version = 0.1.0
 requirements = python3,kivy==2.3.0,requests,urllib3,idna,charset-normalizer,certifi,plyer
 
 orientation = portrait
+fullscreen = 0
 
 # background worker (keeps running with the screen off / app closed)
 services = catcher:service.py:foreground
-fullscreen = 0
 
-# INTERNET: without it every request fails silently
-# VIBRATE: alert when the ticket is booked
-# WAKE_LOCK: lets the keep-screen-on flag work reliably
 android.permissions = INTERNET,VIBRATE,WAKE_LOCK,FOREGROUND_SERVICE,POST_NOTIFICATIONS
-p4a.branch = v2024.01.21
-android.ndk = 25b
 android.api = 33
 android.minapi = 24
 android.archs = arm64-v8a
 android.accept_sdk_license = True
+android.ndk = 25b
+
+# pin python-for-android to a stable release (the default now builds Python 3.14)
+p4a.branch = v2024.01.21
 
 [buildozer]
-log_level = 2
+log_level = 1
 warn_on_root = 1
